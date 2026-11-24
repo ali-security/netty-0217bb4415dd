@@ -1,0 +1,6 @@
+# Appended to the JDK's java.security via -Djava.security.properties (MAVEN_OPTS).
+# The securechat example keystore (SecureChatKeyStore) used by the SSL echo
+# tests holds a 512-bit RSA certificate; Java 7u352 disables RSA keySize < 1024
+# by default, which fails the handshake. Restore the release-era defaults.
+jdk.certpath.disabledAlgorithms=MD2
+jdk.tls.disabledAlgorithms=SSLv3, RC4, NULL
