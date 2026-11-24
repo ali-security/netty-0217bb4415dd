@@ -333,7 +333,7 @@ public abstract class HttpMessageDecoder extends ReplayingDecoder<HttpMessageDec
          * read chunk, read and ignore the CRLF and repeat until 0
          */
         case READ_CHUNK_SIZE: {
-            String line = readLine(buffer, maxInitialLineLength);
+            String line = readChunkSizeLine(buffer, maxInitialLineLength);
             int chunkSize = getChunkSize(line);
             this.chunkSize = chunkSize;
             if (chunkSize == 0) {
@@ -667,21 +667,98 @@ public abstract class HttpMessageDecoder extends ReplayingDecoder<HttpMessageDec
     protected abstract boolean isDecodingRequest();
     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;
 
+    /**
+     * Parses the chunk-size of a chunk-size line (without its CRLF). Only hex digits, optionally followed
+     * by "bad whitespace" (SP / HTAB) and a {@code ';'} that starts the chunk-extensions, are accepted.
+     * Leading whitespace, trailing whitespace without chunk-extensions, control characters and any other
+     * extra tokens are rejected instead of being silently truncated, as a lenient parse would let an
+     * attacker smuggle a request past a front-end that reads the line differently (CVE-2026-93566).
+     */
     private static int getChunkSize(String hex) {
-        hex = hex.trim();
-        for (int i = 0; i < hex.length(); i ++) {
-            char c = hex.charAt(i);
-            if (c == ';' || Character.isWhitespace(c) || Character.isISOControl(c)) {
-                hex = hex.substring(0, i);
-                break;
+        final int length = hex.length();
+        if (length == 0) { // Empty case - not allowed
+            throw new NumberFormatException("Empty chunk size");
+        }
+        long result = 0;
+        for (int i = 0; i < length; i ++) {
+            final int digit = decodeHexNibble(hex.charAt(i));
+            if (digit == -1) {
+                // Uncommon path:
+                // We must either hit the end of the chunk-size line (implicit CRLF from the line reader),
+                // or a ';' character for chunk-extensions, or the "bad whitespace" allowed to precede ';'.
+                char c = hex.charAt(i);
+                int j = 0;
+                while (c == HttpConstants.SP || c == HttpConstants.HT) { // Skip BWS
+                    int index = i + ++j;
+                    if (index >= length) {
+                        throw new NumberFormatException("Invalid chunk size; expected extensions");
+                    }
+                    c = hex.charAt(index);
+                }
+                if (c == ';') {
+                    if (i == 0) { // Empty case - not allowed
+                        throw new NumberFormatException("Empty chunk size");
+                    }
+                    return (int) result;
+                }
+                // Not a hex digit, nor the start of chunk-extensions.
+                throw new NumberFormatException("Invalid character in chunk size");
+            }
+            result *= 16;
+            result += digit;
+            if (result > Integer.MAX_VALUE) {
+                throw new NumberFormatException("Chunk size overflow: " + result);
             }
         }
-
-        return Integer.parseInt(hex, 16);
+        return (int) result;
     }
 
-    private static String readLine(ChannelBuffer buffer, int maxLineLength) throws TooLongFrameException {
-        return readLine(buffer, maxLineLength, 0);
+    /**
+     * Returns the value of the specified ASCII hex digit, or {@code -1} if the specified character
+     * is not one of {@code [0-9a-fA-F]}.
+     */
+    private static int decodeHexNibble(char c) {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return -1;
+    }
+
+    /**
+     * Reads a single CRLF/LF-terminated chunk-size line. Unlike {@link #readLine(ChannelBuffer, int, int)},
+     * a CR that is not followed by LF is kept in the returned line (rather than being dropped together
+     * with the byte that follows it), so that {@link #getChunkSize(String)} rejects it.
+     */
+    private static String readChunkSizeLine(ChannelBuffer buffer, int maxLineLength)
+            throws TooLongFrameException {
+        StringBuilder sb = new StringBuilder(64);
+        int lineLength = 0;
+        while (true) {
+            byte nextByte = buffer.readByte();
+            if (nextByte == HttpConstants.CR) {
+                if (buffer.readByte() == HttpConstants.LF) {
+                    return sb.toString();
+                }
+                // A bare CR does not terminate the line: keep it, and read the byte after it again.
+                buffer.readerIndex(buffer.readerIndex() - 1);
+            } else if (nextByte == HttpConstants.LF) {
+                return sb.toString();
+            }
+            if (lineLength >= maxLineLength) {
+                // Chunk-size line too long: fail the frame.
+                throw new TooLongFrameException(
+                        "An HTTP line is larger than " + maxLineLength +
+                        " bytes.");
+            }
+            lineLength ++;
+            sb.append((char) nextByte);
+        }
     }
 
     /**
